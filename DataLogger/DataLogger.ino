@@ -321,6 +321,52 @@ unsigned long recordStart = 0;
 float axBias = 0, ayBias = 0, azBias = 0;
 float gxBias = 0, gyBias = 0, gzBias = 0;
 
+// Filtering / sampling state
+float axFilt = 0, ayFilt = 0, azFilt = 0;
+float gxFilt = 0, gyFilt = 0, gzFilt = 0;
+
+// small ring buffers for median(3)
+float axBuf[3] = {0,0,0}, ayBuf[3] = {0,0,0}, azBuf[3] = {0,0,0};
+float gxBuf[3] = {0,0,0}, gyBuf[3] = {0,0,0}, gzBuf[3] = {0,0,0};
+uint8_t bufIndex = 0;
+
+// Timing (micros)
+unsigned long lastMicros = 0;
+const unsigned long sampleIntervalUs = 10000; // 100 Hz
+
+// BLE batching
+String bleBatch = "";
+int bleCount = 0;
+const int BLE_BATCH_SIZE = 10;
+
+// Spike clamp thresholds
+const float ACCEL_SPIKE_THRESHOLD = 0.5f; // g
+const float GYRO_SPIKE_THRESHOLD = 200.0f; // deg/s
+
+const float MY_PI = 3.14159265358979323846f;
+
+// helpers
+float median3(float a, float b, float c) {
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
+
+float applyIIR(float prev, float raw, float dt, float fc) {
+  if (dt <= 0) return prev;
+  float rc = 1.0f / (2.0f * MY_PI * fc);
+  float alpha = dt / (rc + dt);
+  return prev + alpha * (raw - prev);
+}
+
+float clampSpike(float prevFilt, float candidate, float thresh) {
+  float delta = candidate - prevFilt;
+  if (fabs(delta) > thresh) {
+    return prevFilt + (delta > 0 ? thresh : -thresh);
+  }
+  return candidate;
+}
+
 // Baseline pressure for relative altitude
 float baselinePressure = 101325.0f; 
 
@@ -390,7 +436,8 @@ void wakeMPU(uint8_t addr) {
 
   Wire.beginTransmission(addr);
   Wire.write(0x1A);
-  Wire.write(0x03);
+  // Reduce sensor internal bandwidth to cut HF noise (DLPF_CFG=4 ≈ 21 Hz)
+  Wire.write(0x04);
   Wire.endTransmission();
 }
 
@@ -563,44 +610,81 @@ void setup() {
 
 // ───────── LOOP ─────────
 void loop() {
-  static unsigned long lastSample = 0;
+  unsigned long now = micros();
   static float alt = 0;
 
-  unsigned long now = millis();
+  if (lastMicros == 0) lastMicros = now;
 
-  if (now - lastSample >= 10) {
-    lastSample += 10; 
+  if (now - lastMicros >= sampleIntervalUs) {
+    unsigned long elapsed = now - lastMicros;
+    float dt = (float)elapsed / 1e6f;
+    lastMicros = now;
 
     float ax, ay, az, gx, gy, gz;
     if (!readMPU(ax, ay, az, gx, gy, gz)) return;
 
-    ax -= axBias;
-    ay -= ayBias;
-    az -= azBias;
-    gx -= gxBias;
-    gy -= gyBias;
-    gz -= gzBias;
+    // Apply bias correction
+    ax -= axBias; ay -= ayBias; az -= azBias;
+    gx -= gxBias; gy -= gyBias; gz -= gzBias;
+
+    // update median ring buffers
+    axBuf[bufIndex] = ax; ayBuf[bufIndex] = ay; azBuf[bufIndex] = az;
+    gxBuf[bufIndex] = gx; gyBuf[bufIndex] = gy; gzBuf[bufIndex] = gz;
+
+    float medAx = median3(axBuf[0], axBuf[1], axBuf[2]);
+    float medAy = median3(ayBuf[0], ayBuf[1], ayBuf[2]);
+    float medAz = median3(azBuf[0], azBuf[1], azBuf[2]);
+
+    float medGx = median3(gxBuf[0], gxBuf[1], gxBuf[2]);
+    float medGy = median3(gyBuf[0], gyBuf[1], gyBuf[2]);
+    float medGz = median3(gzBuf[0], gzBuf[1], gzBuf[2]);
+
+    // advance buffer index
+    bufIndex = (bufIndex + 1) % 3;
+
+    // apply IIR filters
+    axFilt = applyIIR(axFilt, medAx, dt, 15.0f);
+    ayFilt = applyIIR(ayFilt, medAy, dt, 15.0f);
+    azFilt = applyIIR(azFilt, medAz, dt, 15.0f);
+
+    gxFilt = applyIIR(gxFilt, medGx, dt, 20.0f);
+    gyFilt = applyIIR(gyFilt, medGy, dt, 20.0f);
+    gzFilt = applyIIR(gzFilt, medGz, dt, 20.0f);
+
+    // clamp large spikes
+    axFilt = clampSpike(axFilt, axFilt, ACCEL_SPIKE_THRESHOLD);
+    ayFilt = clampSpike(ayFilt, ayFilt, ACCEL_SPIKE_THRESHOLD);
+    azFilt = clampSpike(azFilt, azFilt, ACCEL_SPIKE_THRESHOLD);
+
+    gxFilt = clampSpike(gxFilt, gxFilt, GYRO_SPIKE_THRESHOLD);
+    gyFilt = clampSpike(gyFilt, gyFilt, GYRO_SPIKE_THRESHOLD);
+    gzFilt = clampSpike(gzFilt, gzFilt, GYRO_SPIKE_THRESHOLD);
 
     alt = bmp.getAltitude(baselinePressure, false);
 
     if (recording) {
       unsigned long t = millis() - recordStart;
 
-      // MD INTEGRATION FIX: Formatted altitude to 3 decimal places
       String csv = String(t) + "," +
-                   String(ax,2) + "," +
-                   String(ay,2) + "," +
-                   String(az,2) + "," +
-                   String(gx,2) + "," +
-                   String(gy,2) + "," +
-                   String(gz,2) + "," +
+                   String(axFilt,3) + "," +
+                   String(ayFilt,3) + "," +
+                   String(azFilt,3) + "," +
+                   String(gxFilt,2) + "," +
+                   String(gyFilt,2) + "," +
+                   String(gzFilt,2) + "," +
                    String(alt,3);
 
       Serial.println(csv);
 
-      if (deviceConnected) {
-        logChar->setValue(csv);
+      // batch for BLE to reduce jitter and packet overhead
+      bleBatch += csv + "\n";
+      bleCount++;
+
+      if (deviceConnected && bleCount >= BLE_BATCH_SIZE) {
+        logChar->setValue(bleBatch.c_str());
         logChar->notify();
+        bleBatch = "";
+        bleCount = 0;
       }
     }
   }
