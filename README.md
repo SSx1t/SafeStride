@@ -1,6 +1,8 @@
 # SafeStride - MYOSA 2026
 
-The dataset used is taken from Zenodo which can be found [here](https://zenodo.org/records/11045239)
+The original (without removing irrelevant data) dataset used is taken from Zenodo which can be found [here](https://zenodo.org/records/11045239)
+
+The pruned dataset (which focused on taking only data that matched our specifications) is uploaded to KU's OneDrive which can be found [here](https://kuacae-my.sharepoint.com/:x:/g/personal/100068517_ku_ac_ae/IQB86T1_jdhzRJL9dh7bPrMPAdoFInUusAvuch9Xyi3RMRI?e=LDc60Y)
 
 ---
 
