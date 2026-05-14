@@ -1,4 +1,4 @@
-# SafeStride - MYOSA 2026
+# SafeStride - MYOSA 2026 (ONLY FOR DEVELOPMENT CURRENTLY)
 
 The dataset used is taken from Zenodo which can be found [here](https://zenodo.org/records/11045239)
 
