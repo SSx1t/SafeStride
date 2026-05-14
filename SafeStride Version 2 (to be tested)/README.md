@@ -32,6 +32,11 @@ firmware source mirror lives in `~/Downloads/SafeStride-main/DataLogger/`.
 4. **App-side rolling windows assumed exactly 100 Hz sample rate.** They're
    now time-bounded, so the metrics stay correct when the firmware dips to
    90 Hz (which happens once every 200 ms when the barometer ticks).
+5. **All Serial output is now gated by a `SERIAL_DEBUG` compile-time flag
+   at the top of `DataLogger.ino`** (default `false`). In real-world
+   wireless use nobody reads the USB-Serial stream, so we skip the
+   String construction + UART work entirely on every sample. Flip to
+   `true` if you want to read CSV over USB while debugging.
 
 ---
 
@@ -90,11 +95,30 @@ falls behind by more than 50 ms, `lastSample` is reset to `now` (drop
 the missed samples). Otherwise advance by exactly 10 ms (long-run
 cadence locked to 100 Hz).
 
-### 6. Serial baud → 921 600
-Was 115 200. With `Serial.println(csv)` running 100 Hz at ~60 chars per
-line = 6 000 chars/s, the 115 200 baud TX FIFO filled and `println()`
-blocked the loop. 921 600 baud drains 15× faster than we fill — no
-blocking.
+### 6. Serial output gated by a compile-time `SERIAL_DEBUG` flag
+At the top of `DataLogger.ino`:
+```cpp
+static constexpr bool SERIAL_DEBUG = false;
+```
+Every `Serial.print*()` call is wrapped in `if (SERIAL_DEBUG) ...`, and
+the loop short-circuits before building the CSV string when both
+`SERIAL_DEBUG` is false and no BLE central is connected. Net effect
+with the flag off (the default):
+
+- `Serial.begin()` and its 1.5 s settle delay are skipped at boot
+- The 8-way `String(...)` concatenation per sample is skipped when
+  nothing's listening
+- All ~6 startup/status status prints are dead-code-eliminated
+
+Set to `true` if you want to see CSV output on the Arduino IDE Serial
+Monitor while debugging over USB. Baud stays at 115 200, which is fine
+for our data rate (you can verify the math is favourable: 100 Hz ×
+65 chars ≈ 6.5 kB/s produced vs 11.5 kB/s drain).
+
+Why this matters: the rationale "lower baud is more reliable" actually
+holds for USB-Serial bridges in practice — 921 600 sometimes has
+flakier opens, dropped bytes on cheap CP2102/CH340 chips, and not
+every tool/monitor supports it. 115 200 is the safe default.
 
 ### 7. Calibration auto-detects gravity-aligned axis
 Original code hard-coded gravity to Y axis (`ayBias -= 1.0f`). If the
@@ -180,20 +204,26 @@ sample per BLE notification. Once the buffer is full, runs feature
 extraction + `GaitModel.score()` every 250 samples (= 2.5 s at 100 Hz)
 — this matches the trainer's 5-second windows with 50 % overlap.
 
-Axis remap for our hardware mounting (MYOSA chip face-up at the
-tailbone):
+Axis remap for our hardware mounting (MYOSA mounted vertically at the
+tailbone, chip face pointing posterior — confirmed visually from the
+GY-521 axis silkscreen):
 ```
-vert ← (sample.accelZ − 1.0) × G   // remove gravity, m/s²
-ml   ← sample.accelX × G           // medio-lateral (assumed), m/s²
-yaw  ← sample.gyroZ                // rotation about vertical, °/s
+vert ← (sample.accelY − 1.0) × G   // remove gravity, m/s²
+ml   ← sample.accelX × G           // medio-lateral (wearer's left/right)
+yaw  ← sample.gyroY                // rotation about vertical, °/s
 ```
-In the Felius training data `ax` was vertical and `gx` was yaw; on our
-hardware Z is vertical because the chip points up. The four
-top-importance features (`vert_std`, `step_ac`, `vert_kurt`,
-`yaw_std`, `cadence_spm`) only depend on `vert` and `yaw`, so even if
-`accelX` and `accelY` should be swapped relative to the user's body
-the prediction is still valid; only the three low-importance `ml_*`
-features would shift.
+Why this remap: with the PCB vertical at the lower back and chip face
+pointing posteriorly, the GY-521's +Y silkscreen arrow points up
+(toward the head) and +X points to the wearer's left. The +Z axis
+points out of the chip face (anteroposterior) and is not used by the
+18-feature model. In the Felius training data the convention was
+different (`ax` vertical, `gx` yaw), so we substitute our `accelY`
+into the trainer's `vert` slot and our `gyroY` into the `yaw` slot.
+
+An earlier version of this remap used `accelZ` / `gyroZ` based on a
+"chip face up" mounting assumption that turned out to be wrong; the
+GY-521 silkscreen on the actual board confirms Y is vertical for this
+PCB orientation.
 
 **`GaitVerdict.kt`** (in `data/model/`).
 Enum (`HEALTHY`, `STROKE_LIKE`, `PENDING`) + the
