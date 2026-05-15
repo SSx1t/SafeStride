@@ -720,9 +720,13 @@ void loop() {
   ax -= axBias;  ay -= ayBias;  az -= azBias;
   gx -= gxBias;  gy -= gyBias;  gz -= gzBias;
 
-  // Feed ML pipeline with the same raw bias-corrected signal path as training.
-  // The training pipeline uses ax as vertical, ay as medio-lateral, gx as yaw.
-  pushGaitSample((ax - 1.0f) * G_CONST, ay * G_CONST, gx);
+  // Feed ML pipeline with the same body-frame variables the trainer used,
+  // remapped from this hardware's mounting (MYOSA at the lumbar, chip face
+  // posterior; Y vertical, X medio-lateral, Z anteroposterior — confirmed
+  // from the GY-521 silkscreen). The training script uses ax/ay/gx for
+  // vert/ml/yaw because its dataset has X-vertical mounting; here we map
+  // ay/ax/gy to give the model the same body-frame quantities it expects.
+  pushGaitSample((ay - 1.0f) * G_CONST, ax * G_CONST, gy);
   if (recording) {
     runGaitInferenceIfReady();
   }
