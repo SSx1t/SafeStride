@@ -21,10 +21,11 @@
  *  - I²C bus bumped to 400 kHz fast-mode (all three MYOSA sensors support it).
  *  - Loop catch-up is bounded: a long blocking call (BMP, OLED, BLE stack)
  *    resets the cadence instead of bursting 100s of samples to "catch up".
- *  - Serial baud bumped to 921600 so 100 Hz CSV prints don't back-pressure
- *    the loop via a full TX FIFO.
  *  - Calibration auto-detects which axis is gravity-aligned, so the rest
  *    magnitude is ≈ 1.0 g regardless of how the belt is mounted.
+ *  - All Serial Monitor output is gated by the `SERIAL_DEBUG` compile-time
+ *    flag at the top of this file. Off by default — flip to `true` for
+ *    USB debugging.
  *
  * BLE wire format, UUIDs, device name, and start/stop bytes are unchanged
  * — the Android app speaks this firmware verbatim.
@@ -47,6 +48,12 @@
 static const uint32_t SAMPLE_PERIOD_MS     = 10;   // 100 Hz IMU
 static const uint32_t BARO_PERIOD_MS       = 200;  // ~5 Hz altitude refresh
 static const uint32_t CATCHUP_THRESHOLD_MS = 50;   // reset, don't burst, on long stalls
+
+// Flip to true to re-enable Serial Monitor output (USB-Serial debug
+// stream). Off by default because in real-world use the phone over BLE
+// is the only consumer — disabling Serial saves the String concatenation
+// + UART work on every sample and a few startup status prints.
+static constexpr bool SERIAL_DEBUG = false;
 
 uint8_t mpuAddr = 0;
 
@@ -180,7 +187,7 @@ bool readMPU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
 
 // ───────── CALIBRATION ─────────
 void calibrateMPU() {
-  Serial.println("# Calibrating... keep device still");
+  if (SERIAL_DEBUG) Serial.println("# Calibrating... keep device still");
 
   const int N = 300;
   float sx = 0, sy = 0, sz = 0;
@@ -197,7 +204,7 @@ void calibrateMPU() {
     delay(10);
   }
   if (ok < 50) {
-    Serial.println("# Calibration FAILED — too few good reads");
+    if (SERIAL_DEBUG) Serial.println("# Calibration FAILED — too few good reads");
     return;
   }
 
@@ -216,21 +223,23 @@ void calibrateMPU() {
     azBias -= (azBias >= 0 ? 1.0f : -1.0f);
   }
 
-  Serial.print("# Calibration done — good reads: ");
-  Serial.println(ok);
+  if (SERIAL_DEBUG) {
+    Serial.print("# Calibration done — good reads: ");
+    Serial.println(ok);
+  }
 }
 
 // ───────── BLE ─────────
 void startRecording() {
   recordStart = millis();
   recording = true;
-  Serial.println("# RECORDING STARTED");
+  if (SERIAL_DEBUG) Serial.println("# RECORDING STARTED");
   showRecording();
 }
 
 void stopRecording() {
   recording = false;
-  Serial.println("# RECORDING STOPPED");
+  if (SERIAL_DEBUG) Serial.println("# RECORDING STOPPED");
   showReady();
 }
 
@@ -288,8 +297,12 @@ void setupBLE() {
 
 // ───────── SETUP ─────────
 void setup() {
-  Serial.begin(921600);
-  delay(1500);
+  // Serial is gated by SERIAL_DEBUG (see top of file). When disabled we
+  // skip Serial.begin and the 1.5 s settle delay entirely.
+  if (SERIAL_DEBUG) {
+    Serial.begin(115200);
+    delay(1500);
+  }
 
   Wire.begin();
   Wire.setClock(400000);
@@ -319,7 +332,7 @@ void setup() {
     delay(50);
     calibrateMPU();
   } else {
-    Serial.println("# MPU6050 not found on bus");
+    if (SERIAL_DEBUG) Serial.println("# MPU6050 not found on bus");
   }
 
   showWaiting();
@@ -362,6 +375,9 @@ void loop() {
 
   if (!recording) return;
 
+  // Skip String construction entirely if nobody's listening.
+  if (!deviceConnected && !SERIAL_DEBUG) return;
+
   unsigned long t = millis() - recordStart;
 
   String csv = String(t) + "," +
@@ -373,7 +389,7 @@ void loop() {
                String(gz, 2) + "," +
                String(cachedAlt, 3);
 
-  Serial.println(csv);
+  if (SERIAL_DEBUG) Serial.println(csv);
 
   if (deviceConnected) {
     logChar->setValue(csv);
