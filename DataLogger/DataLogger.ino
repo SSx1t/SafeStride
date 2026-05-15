@@ -55,6 +55,13 @@ static const int      GAIT_WINDOW_SAMPLES   = 1000;  // 10 s at 100 Hz
 static const int      GAIT_PREDICTION_STEP  = 50;    // 500 ms
 static const bool     ML_DEBUG_FEATURES     = false;
 
+// Master Serial-Monitor switch. False (default) = no Serial.begin, no UART
+// writes, no snprintf done purely for printing — entire path is dead-code-
+// eliminated by the compiler. Flip to true only when debugging over USB.
+// In wireless/BLE-only use the phone is the sole consumer; running 100 Hz
+// CSV through the UART steals cycles and adds jitter to BLE notifies.
+static constexpr bool SERIAL_DEBUG          = false;
+
 uint8_t mpuAddr = 0;
 
 // Tell the OLED driver to leave the bus at 400 kHz after its writes
@@ -394,7 +401,7 @@ void publishMlLabel(MlLabel rawLabel, MlLabel stableLabel, const float features[
     }
   }
 
-  if (ML_DEBUG_FEATURES) {
+  if (SERIAL_DEBUG && ML_DEBUG_FEATURES) {
     Serial.print("# ML ");
     for (int i = 0; i < 18; i++) {
       if (i) Serial.print(',');
@@ -535,7 +542,7 @@ bool readMPU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
 
 // ───────── CALIBRATION ─────────
 void calibrateMPU() {
-  Serial.println("# Calibrating... keep device still");
+  if (SERIAL_DEBUG) Serial.println("# Calibrating... keep device still");
 
   const int N = 300;
   float sx = 0, sy = 0, sz = 0;
@@ -552,7 +559,7 @@ void calibrateMPU() {
     delay(10);
   }
   if (ok < 50) {
-    Serial.println("# Calibration FAILED — too few good reads");
+    if (SERIAL_DEBUG) Serial.println("# Calibration FAILED — too few good reads");
     return;
   }
 
@@ -571,8 +578,10 @@ void calibrateMPU() {
     azBias -= (azBias >= 0 ? 1.0f : -1.0f);
   }
 
-  Serial.print("# Calibration done — good reads: ");
-  Serial.println(ok);
+  if (SERIAL_DEBUG) {
+    Serial.print("# Calibration done — good reads: ");
+    Serial.println(ok);
+  }
 }
 
 // ───────── BLE ─────────
@@ -580,13 +589,13 @@ void startRecording() {
   recordStart = millis();
   recording = true;
   resetGaitPipeline();
-  Serial.println("# RECORDING STARTED");
+  if (SERIAL_DEBUG) Serial.println("# RECORDING STARTED");
   showRecording();
 }
 
 void stopRecording() {
   recording = false;
-  Serial.println("# RECORDING STOPPED");
+  if (SERIAL_DEBUG) Serial.println("# RECORDING STOPPED");
   showReady();
 }
 
@@ -646,8 +655,12 @@ void setupBLE() {
 
 // ───────── SETUP ─────────
 void setup() {
-  Serial.begin(921600);
-  delay(1500);
+  // Skip Serial.begin entirely when SERIAL_DEBUG is off — saves the 1.5 s
+  // settle wait at boot and frees the UART hardware.
+  if (SERIAL_DEBUG) {
+    Serial.begin(921600);
+    delay(1500);
+  }
 
   Wire.begin();
   Wire.setClock(400000);
@@ -677,7 +690,7 @@ void setup() {
     delay(50);
     calibrateMPU();
   } else {
-    Serial.println("# MPU6050 not found on bus");
+    if (SERIAL_DEBUG) Serial.println("# MPU6050 not found on bus");
   }
 
   showWaiting();
@@ -751,11 +764,15 @@ void loop() {
 
   unsigned long t = millis() - recordStart;
 
+  // Skip the snprintf entirely if nothing's listening — at 100 Hz this
+  // saves ~80 µs / sample and reduces BLE-notify jitter.
+  if (!deviceConnected && !SERIAL_DEBUG) return;
+
   char buf[128];
   int n = snprintf(buf, sizeof(buf), "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f",
                    t, out_ax, out_ay, out_az, out_gx, out_gy, out_gz, cachedAlt);
   if (n > 0) {
-    Serial.println(buf);
+    if (SERIAL_DEBUG) Serial.println(buf);
     if (deviceConnected) {
       logChar->setValue(std::string(buf));
       logChar->notify();
