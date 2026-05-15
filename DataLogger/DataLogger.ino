@@ -36,10 +36,12 @@
 
 #include "oled.h"
 #include "BarometricPressure.h"
+#include "gait_model.h"
 
 #define SERVICE_UUID    "4f5b1a00-7b3a-4f9b-9e80-1a1e5b7c2d40"
 #define CMD_CHAR_UUID   "4f5b1a01-7b3a-4f9b-9e80-1a1e5b7c2d40"
 #define LOG_CHAR_UUID   "4f5b1a04-7b3a-4f9b-9e80-1a1e5b7c2d40"
+#define ML_CHAR_UUID    "4f5b1a05-7b3a-4f9b-9e80-1a1e5b7c2d40"
 
 #define MPU_ADDR_PRIMARY 0x68
 #define MPU_ADDR_ALT     0x69
@@ -47,6 +49,11 @@
 static const uint32_t SAMPLE_PERIOD_MS     = 10;   // 100 Hz IMU
 static const uint32_t BARO_PERIOD_MS       = 200;  // ~5 Hz altitude refresh
 static const uint32_t CATCHUP_THRESHOLD_MS = 50;   // reset, don't burst, on long stalls
+static const float    G_CONST              = 9.81f;
+static const int      TARGET_HZ            = 100;
+static const int      GAIT_WINDOW_SAMPLES   = 1000;  // 10 s at 100 Hz
+static const int      GAIT_PREDICTION_STEP  = 50;    // 500 ms
+static const bool     ML_DEBUG_FEATURES     = false;
 
 uint8_t mpuAddr = 0;
 
@@ -57,6 +64,7 @@ BarometricPressure bmp(ULTRA_LOW_POWER);
 
 NimBLECharacteristic* logChar = nullptr;
 NimBLECharacteristic* cmdChar = nullptr;
+NimBLECharacteristic* mlChar  = nullptr;
 
 bool deviceConnected = false;
 bool recording = false;
@@ -69,7 +77,7 @@ float gxBias = 0, gyBias = 0, gzBias = 0;
 float baselinePressure = 101325.0f;
 float cachedAlt = 0.0f;
 // ---------- FILTERING / SMOOTHING ----------
-static const bool STREAM_FILTERED_VALUES = true;
+static const bool STREAM_FILTERED_VALUES = false;
 static const float ACC_ALPHA = 0.30f;
 static const float GYR_ALPHA = 0.35f;
 static const float ALT_ALPHA = 0.10f;
@@ -87,6 +95,334 @@ struct LowPass1 {
 LowPass1 axLP, ayLP, azLP;
 LowPass1 gxLP, gyLP, gzLP;
 LowPass1 altLP;
+
+Eloquent::ML::Port::GaitClassifier gaitClassifier;
+
+enum MlLabel : uint8_t {
+  LABEL_NO_GAIT = 0,
+  LABEL_HEALTHY_GAIT = 1,
+  LABEL_STROKE_GAIT = 2
+};
+
+struct GaitSample {
+  float vertDyn;
+  float mlDyn;
+  float yaw;
+};
+
+struct GaitFeatureWindow {
+  float vert[GAIT_WINDOW_SAMPLES];
+  float ml[GAIT_WINDOW_SAMPLES];
+  float yaw[GAIT_WINDOW_SAMPLES];
+};
+
+static GaitSample gaitBuf[GAIT_WINDOW_SAMPLES];
+static int gaitHead = 0;
+static int gaitCount = 0;
+static int samplesSincePrediction = 0;
+static GaitFeatureWindow gaitWin;
+
+class MlLabelSmoother {
+public:
+  static const int N = 7;
+
+  MlLabelSmoother() { reset(); }
+
+  void reset() {
+    for (int i = 0; i < N; i++) hist[i] = LABEL_NO_GAIT;
+    idx = 0;
+    count = 0;
+    stable = LABEL_NO_GAIT;
+  }
+
+  MlLabel update(MlLabel label) {
+    hist[idx] = label;
+    idx = (idx + 1) % N;
+    if (count < N) count++;
+
+    int noGait = 0, healthy = 0, stroke = 0;
+    for (int i = 0; i < count; i++) {
+      if (hist[i] == LABEL_NO_GAIT) noGait++;
+      else if (hist[i] == LABEL_HEALTHY_GAIT) healthy++;
+      else if (hist[i] == LABEL_STROKE_GAIT) stroke++;
+    }
+
+    MlLabel majority = LABEL_NO_GAIT;
+    int best = noGait;
+    if (healthy > best) { best = healthy; majority = LABEL_HEALTHY_GAIT; }
+    if (stroke > best)  { best = stroke;  majority = LABEL_STROKE_GAIT; }
+
+    stable = majority;
+    return stable;
+  }
+
+  MlLabel get() const { return stable; }
+
+private:
+  MlLabel hist[N];
+  int idx = 0;
+  int count = 0;
+  MlLabel stable = LABEL_NO_GAIT;
+};
+
+MlLabelSmoother mlSmoother;
+
+// ───────── ML FEATURE / LABEL PIPELINE ─────────
+void resetGaitPipeline() {
+  gaitHead = 0;
+  gaitCount = 0;
+  samplesSincePrediction = 0;
+  mlSmoother.reset();
+}
+
+void pushGaitSample(float vertDyn, float mlDyn, float yaw) {
+  gaitBuf[gaitHead].vertDyn = vertDyn;
+  gaitBuf[gaitHead].mlDyn = mlDyn;
+  gaitBuf[gaitHead].yaw = yaw;
+  gaitHead = (gaitHead + 1) % GAIT_WINDOW_SAMPLES;
+  if (gaitCount < GAIT_WINDOW_SAMPLES) gaitCount++;
+  samplesSincePrediction++;
+}
+
+void copyGaitWindow() {
+  int start = (gaitCount < GAIT_WINDOW_SAMPLES) ? 0 : gaitHead;
+  for (int i = 0; i < GAIT_WINDOW_SAMPLES; i++) {
+    int idx = (start + i) % GAIT_WINDOW_SAMPLES;
+    gaitWin.vert[i] = gaitBuf[idx].vertDyn;
+    gaitWin.ml[i] = gaitBuf[idx].mlDyn;
+    gaitWin.yaw[i] = gaitBuf[idx].yaw;
+  }
+}
+
+float meanOf(const float* x, int n) {
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) sum += x[i];
+  return (float)(sum / n);
+}
+
+float stdOf(const float* x, int n, float mean) {
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) {
+    double d = x[i] - mean;
+    sum += d * d;
+  }
+  return (float)sqrt(sum / n);
+}
+
+float rangeOf(const float* x, int n) {
+  float mn = x[0], mx = x[0];
+  for (int i = 1; i < n; i++) {
+    if (x[i] < mn) mn = x[i];
+    if (x[i] > mx) mx = x[i];
+  }
+  return mx - mn;
+}
+
+float rmsOf(const float* x, int n) {
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) sum += (double)x[i] * (double)x[i];
+  return (float)sqrt(sum / n);
+}
+
+float absMeanOf(const float* x, int n) {
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) sum += fabsf(x[i]);
+  return (float)(sum / n);
+}
+
+float skewOf(const float* x, int n, float mean, float stdv) {
+  if (stdv < 1e-6f) return 0.0f;
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) {
+    double z = (x[i] - mean) / stdv;
+    sum += z * z * z;
+  }
+  return (float)(sum / n);
+}
+
+float kurtOf(const float* x, int n, float mean, float stdv) {
+  if (stdv < 1e-6f) return 0.0f;
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) {
+    double z = (x[i] - mean) / stdv;
+    sum += z * z * z * z;
+  }
+  return (float)((sum / n) - 3.0);
+}
+
+float autocorrAtLag(const float* x, int n, int lag) {
+  if (lag >= n) return 0.0f;
+  float mean = meanOf(x, n);
+  double denom = 0.0, num = 0.0;
+  for (int i = 0; i < n; i++) {
+    double d = x[i] - mean;
+    denom += d * d;
+  }
+  if (denom < 1e-6) return 0.0f;
+  for (int i = 0; i < n - lag; i++) {
+    num += (x[i] - mean) * (x[i + lag] - mean);
+  }
+  return (float)(num / denom);
+}
+
+int findStepPeaks(const float* x, int n, int* peakIdx, int maxPeaks) {
+  const float threshold = 0.35f * G_CONST;
+  const int minDistance = 25;
+  int count = 0;
+  int lastPeak = -minDistance;
+
+  for (int i = 1; i < n - 1; i++) {
+    bool localMax = (x[i] > x[i - 1]) && (x[i] >= x[i + 1]);
+    bool aboveThr = x[i] > threshold;
+    bool farEnough = (i - lastPeak) >= minDistance;
+    if (localMax && aboveThr && farEnough) {
+      if (count < maxPeaks) peakIdx[count] = i;
+      count++;
+      lastPeak = i;
+    }
+  }
+
+  return (count > maxPeaks) ? maxPeaks : count;
+}
+
+bool extractGaitFeatures(const GaitFeatureWindow& win, float features[18]) {
+  const float* vert = win.vert;
+  const float* ml = win.ml;
+  const float* yaw = win.yaw;
+
+  float vertMean = meanOf(vert, GAIT_WINDOW_SAMPLES);
+  float vertStd = stdOf(vert, GAIT_WINDOW_SAMPLES, vertMean);
+  float mlMean = meanOf(ml, GAIT_WINDOW_SAMPLES);
+  float mlStd = stdOf(ml, GAIT_WINDOW_SAMPLES, mlMean);
+  float yawMean = meanOf(yaw, GAIT_WINDOW_SAMPLES);
+  float yawStd = stdOf(yaw, GAIT_WINDOW_SAMPLES, yawMean);
+
+  features[0]  = vertMean;
+  features[1]  = vertStd;
+  features[2]  = rangeOf(vert, GAIT_WINDOW_SAMPLES);
+  features[3]  = skewOf(vert, GAIT_WINDOW_SAMPLES, vertMean, vertStd);
+  features[4]  = kurtOf(vert, GAIT_WINDOW_SAMPLES, vertMean, vertStd);
+  features[5]  = mlStd;
+  features[6]  = rmsOf(ml, GAIT_WINDOW_SAMPLES);
+  features[7]  = rangeOf(ml, GAIT_WINDOW_SAMPLES);
+  features[8]  = yawStd;
+  features[9]  = absMeanOf(yaw, GAIT_WINDOW_SAMPLES);
+
+  int peakIdx[128];
+  int peakCount = findStepPeaks(vert, GAIT_WINDOW_SAMPLES, peakIdx, 128);
+  features[10] = (float)peakCount;
+
+  if (peakCount > 1) {
+    float sumIntervals = 0.0f;
+    float sumIntervalsSq = 0.0f;
+    for (int i = 1; i < peakCount; i++) {
+      float interval = (float)(peakIdx[i] - peakIdx[i - 1]) / TARGET_HZ;
+      sumIntervals += interval;
+      sumIntervalsSq += interval * interval;
+    }
+    float meanInterval = sumIntervals / (peakCount - 1);
+    features[11] = 60.0f / meanInterval;
+    float intervalVar = (sumIntervalsSq / (peakCount - 1)) - (meanInterval * meanInterval);
+    if (intervalVar < 0.0f) intervalVar = 0.0f;
+    features[12] = (meanInterval > 1e-6f) ? sqrtf(intervalVar) / meanInterval : 0.0f;
+  } else {
+    features[11] = 0.0f;
+    features[12] = 0.0f;
+  }
+
+  float bestAc = 0.0f;
+  int bestLag = 0;
+  for (int lag = 30; lag < 80; lag++) {
+    float ac = autocorrAtLag(vert, GAIT_WINDOW_SAMPLES, lag);
+    if (ac > bestAc) {
+      bestAc = ac;
+      bestLag = lag;
+    }
+  }
+  features[13] = bestAc;
+
+  int strideLag = bestLag * 2;
+  float strideAc = (strideLag < GAIT_WINDOW_SAMPLES) ? autocorrAtLag(vert, GAIT_WINDOW_SAMPLES, strideLag) : 0.0f;
+  features[14] = strideAc;
+  features[15] = (strideAc > 0.1f) ? (bestAc / strideAc) : 0.0f;
+
+  float jerk[GAIT_WINDOW_SAMPLES - 1];
+  for (int i = 0; i < GAIT_WINDOW_SAMPLES - 1; i++) {
+    jerk[i] = vert[i + 1] - vert[i];
+  }
+  features[16] = stdOf(jerk, GAIT_WINDOW_SAMPLES - 1, meanOf(jerk, GAIT_WINDOW_SAMPLES - 1));
+  float jerkMax = 0.0f;
+  for (int i = 0; i < GAIT_WINDOW_SAMPLES - 1; i++) {
+    float a = fabsf(jerk[i]);
+    if (a > jerkMax) jerkMax = a;
+  }
+  features[17] = jerkMax;
+
+  return true;
+}
+
+bool isValidGaitWindow(const float features[18]) {
+  bool enoughSteps = features[10] >= 4.0f;
+  bool cadenceOk = features[11] >= 40.0f && features[11] <= 180.0f;
+  bool motionOk = features[1] >= 0.15f;
+  bool periodicEnough = features[13] >= 0.10f;
+  return enoughSteps && cadenceOk && motionOk && periodicEnough;
+}
+
+const char* labelToText(MlLabel label) {
+  switch (label) {
+    case LABEL_HEALTHY_GAIT: return "healthy_gait";
+    case LABEL_STROKE_GAIT:  return "stroke_gait";
+    default:                 return "no_gait";
+  }
+}
+
+void publishMlLabel(MlLabel rawLabel, MlLabel stableLabel, const float features[18]) {
+  char msg[160];
+  unsigned long t = millis() - recordStart;
+  snprintf(msg, sizeof(msg), "%lu,%s,%s,%.0f,%.1f,%.3f",
+           t,
+           labelToText(rawLabel),
+           labelToText(stableLabel),
+           features[10],
+           features[11],
+           features[13]);
+  if (mlChar != nullptr) {
+    mlChar->setValue(std::string(msg));
+    if (deviceConnected) {
+      mlChar->notify();
+    }
+  }
+
+  if (ML_DEBUG_FEATURES) {
+    Serial.print("# ML ");
+    for (int i = 0; i < 18; i++) {
+      if (i) Serial.print(',');
+      Serial.print(features[i], 4);
+    }
+    Serial.println();
+  }
+}
+
+void runGaitInferenceIfReady() {
+  if (gaitCount < GAIT_WINDOW_SAMPLES) return;
+  if (samplesSincePrediction < GAIT_PREDICTION_STEP) return;
+  samplesSincePrediction = 0;
+
+  copyGaitWindow();
+
+  float features[18];
+  if (!extractGaitFeatures(gaitWin, features)) return;
+
+  MlLabel rawLabel = LABEL_NO_GAIT;
+  if (isValidGaitWindow(features)) {
+    int pred = gaitClassifier.predict(features);
+    rawLabel = (pred == 0) ? LABEL_HEALTHY_GAIT : LABEL_STROKE_GAIT;
+  }
+
+  MlLabel stableLabel = mlSmoother.update(rawLabel);
+  publishMlLabel(rawLabel, stableLabel, features);
+}
 
 // ───────── OLED ─────────
 void showWaiting() {
@@ -243,6 +579,7 @@ void calibrateMPU() {
 void startRecording() {
   recordStart = millis();
   recording = true;
+  resetGaitPipeline();
   Serial.println("# RECORDING STARTED");
   showRecording();
 }
@@ -288,6 +625,8 @@ void setupBLE() {
   cmdChar->setCallbacks(new CmdCB());
 
   logChar = svc->createCharacteristic(LOG_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
+
+  mlChar = svc->createCharacteristic(ML_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
   svc->start();
 
@@ -360,7 +699,8 @@ void loop() {
     float pBar = bmp.getPressureBar(false);
     if (pBar > 0.0f) {
       float pPa = pBar * 100.0f;
-      cachedAlt = 44330.0f * (1.0f - powf(pPa / baselinePressure, 1.0f / 5.255f));
+      float rawAlt = 44330.0f * (1.0f - powf(pPa / baselinePressure, 1.0f / 5.255f));
+      cachedAlt = altLP.update(rawAlt, ALT_ALPHA);
     }
     now = millis();  // BMP read just consumed ~10 ms; refresh.
   }
@@ -379,6 +719,13 @@ void loop() {
   // Bias-correct
   ax -= axBias;  ay -= ayBias;  az -= azBias;
   gx -= gxBias;  gy -= gyBias;  gz -= gzBias;
+
+  // Feed ML pipeline with the same raw bias-corrected signal path as training.
+  // The training pipeline uses ax as vertical, ay as medio-lateral, gx as yaw.
+  pushGaitSample((ax - 1.0f) * G_CONST, ay * G_CONST, gx);
+  if (recording) {
+    runGaitInferenceIfReady();
+  }
 
   // Update software low-pass filters (keeps smooth output, but low lag with chosen alpha)
   float axf = axLP.update(ax, ACC_ALPHA);
