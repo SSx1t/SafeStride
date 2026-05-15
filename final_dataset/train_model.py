@@ -24,13 +24,15 @@ from sklearn.metrics import (classification_report, confusion_matrix,
 # =============================================================
 # CONFIG
 # =============================================================
-DATA_FILE = Path.home() / "Downloads" / "final_dataset" / "combined_lower_back.csv"
+DATA_FILE = Path(__file__).resolve().parent / "combined_lower_back.csv"
 
 SOURCE_HZ = 104                                  # dataset sample rate
 TARGET_HZ = 100                                  # MYOSA sample rate
-WINDOW_SEC = 5.0
+WINDOW_SEC = 10.0
 WINDOW_SIZE = int(WINDOW_SEC * TARGET_HZ)        # 500 samples per window
 STRIDE = WINDOW_SIZE // 2                        # 50% overlap
+STEP_PEAK_MIN_DISTANCE = 25
+STEP_PEAK_PROMINENCE = 0.10 * 9.81
 
 # CRITICAL: dataset axis convention.
 # Discovered by inspecting means: AX has mean +0.94g → AX is the vertical axis.
@@ -66,6 +68,16 @@ def autocorr_at_lag(x, lag):
     return float(np.sum(x[:len(x)-lag] * x[lag:]) / denom)
 
 
+def lowpass_5hz(x):
+    if len(x) < 16:
+        return x
+    b, a = signal.butter(4, 5.0 / (TARGET_HZ / 2.0), btype='low')
+    padlen = min(len(x) - 1, 3 * max(len(a), len(b)))
+    if padlen <= 0:
+        return x
+    return signal.filtfilt(b, a, x, padlen=padlen)
+
+
 def extract_features(vert, ml, yaw):
     """18-feature vector. Order = FEATURE_COLS."""
     f = {}
@@ -80,7 +92,7 @@ def extract_features(vert, ml, yaw):
     f['yaw_std']      = float(np.std(yaw))
     f['yaw_abs_mean'] = float(np.mean(np.abs(yaw)))
 
-    peaks, _ = signal.find_peaks(vert, height=0.35*G, distance=25)
+    peaks, _ = signal.find_peaks(vert, height=0.35 * G, distance=25)
     f['step_count'] = len(peaks)
     if len(peaks) > 1:
         intervals = np.diff(peaks) / TARGET_HZ
@@ -188,8 +200,8 @@ def main():
     for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups), 1):
         # Find this block in train_model.py and update:
         clf = RandomForestClassifier(
-            n_estimators=30,           # was 10 — more trees = more accurate
-            max_depth=8,               # was 6 — slightly deeper
+            n_estimators=20,           # was 10 — more trees = more accurate
+            max_depth=9,               # was 6 — slightly deeper
             min_samples_leaf=10,       # was 5 — bigger leaves resist overfitting
             class_weight='balanced',   # keep
             random_state=42, n_jobs=-1
@@ -218,7 +230,7 @@ def main():
     # =========================================================
     print(f"\n=== Training Final Model on All Data ===")
     clf_final = RandomForestClassifier(
-        n_estimators=10, max_depth=6, min_samples_leaf=5,
+        n_estimators=20, max_depth=9, min_samples_leaf=10,
         class_weight='balanced', random_state=42, n_jobs=-1
     )
     clf_final.fit(X, y)
